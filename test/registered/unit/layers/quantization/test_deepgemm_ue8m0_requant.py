@@ -65,6 +65,39 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
         self.assertTrue(weight_scale.format_ue8m0)
         requant.assert_called_once_with(weight, weight_scale, BLOCK_SIZE)
 
+    def test_dense_deepgemm_accepts_prequantized_packed_ue8m0_scale(self):
+        input_tensor = torch.zeros((2, 128), dtype=torch.float8_e4m3fn)
+        input_scale = torch.zeros((2, 1), dtype=torch.int32)
+        weight = torch.zeros((64, 128), dtype=torch.float8_e4m3fn)
+        weight_scale = torch.zeros((64, 1), dtype=torch.int32)
+        expected = torch.zeros((2, 64), dtype=torch.bfloat16)
+
+        with (
+            self._enabled_deepgemm_ue8m0(),
+            patch.object(
+                fp8_utils,
+                "w8a8_block_fp8_matmul_deepgemm",
+                return_value=expected,
+            ) as matmul,
+        ):
+            result = fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback(
+                input_tensor,
+                weight,
+                BLOCK_SIZE,
+                weight_scale,
+                input_scale=input_scale,
+            )
+
+        torch.testing.assert_close(result, expected)
+        matmul.assert_called_once()
+        args, kwargs = matmul.call_args
+        torch.testing.assert_close(args[0], input_tensor)
+        torch.testing.assert_close(args[1], weight)
+        torch.testing.assert_close(args[2], input_scale)
+        torch.testing.assert_close(args[3], weight_scale)
+        self.assertEqual(args[4], BLOCK_SIZE)
+        self.assertEqual(kwargs, {"output_dtype": torch.bfloat16})
+
     def test_helper_skips_non_bf16_output(self):
         weight, weight_scale = _make_params()
 

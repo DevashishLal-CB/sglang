@@ -120,6 +120,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import (
+    deepgemm_w8a8_block_fp8_linear_with_fallback,
     emit_transposed_bpreshuffle_scale,
     materialize_bpreshuffle_fp8_scale,
     view_aiter_fused_rms_transposed_fp8_scale,
@@ -205,6 +206,21 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+
+
+def _linear_accepts_flashinfer_fused_ar_quant(linear: nn.Module) -> bool:
+    """Whether ``linear`` consumes FlashInfer's packed DeepSeek FP8 tuple."""
+    quant_method = getattr(linear, "quant_method", None)
+    return bool(
+        _is_cuda
+        and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        and get_exec().comm.flashinfer_allreduce_fusion_backend == "trtllm"
+        and getattr(quant_method, "block_quant", False)
+        and tuple(getattr(quant_method, "weight_block_size", ())) == (128, 128)
+        and getattr(quant_method, "w8a8_block_fp8_linear", None)
+        is deepgemm_w8a8_block_fp8_linear_with_fallback
+    )
+
 
 if _use_aiter:
     from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
@@ -881,6 +897,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
@@ -917,6 +934,7 @@ class DeepseekV2MoE(nn.Module):
                     input_ids,
                     input_ids_global=input_ids_global,
                     num_token_non_padded=num_token_non_padded,
+                    pre_quant_input=pre_quant_input,
                 )
             else:
                 return self.forward_normal(
@@ -926,6 +944,7 @@ class DeepseekV2MoE(nn.Module):
                     input_ids_global=input_ids_global,
                     skip_shared_experts=skip_shared_experts,
                     num_token_non_padded=num_token_non_padded,
+                    pre_quant_input=pre_quant_input,
                 )
         else:
             return self.forward_deepep(
@@ -939,6 +958,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         num_token_non_padded: Optional[torch.Tensor] = None,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         # Note(kpham-sgl): issue order satisfies 3 constraints:
         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
@@ -949,11 +969,11 @@ class DeepseekV2MoE(nn.Module):
         current_stream = torch.cuda.current_stream()
         # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE) must happen on the main
         # stream BEFORE the alt-stream fork so both consumers see it.
-        pre_quant_input = (
-            None
-            if use_flashinfer_trtllm_bypass
-            else self._maybe_quant_moe_input_once(hidden_states)
-        )
+        routed_pre_quant_input = None
+        shared_pre_quant_input = pre_quant_input
+        if shared_pre_quant_input is None and not use_flashinfer_trtllm_bypass:
+            routed_pre_quant_input = self._maybe_quant_moe_input_once(hidden_states)
+            shared_pre_quant_input = routed_pre_quant_input
         self.alt_stream.wait_stream(current_stream)
         has_shared_output = (
             hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
@@ -996,9 +1016,9 @@ class DeepseekV2MoE(nn.Module):
             )
         elif use_flashinfer_trtllm_bypass:
             final_hidden_states = self.experts.forward_impl(hidden_states, topk_output)
-        elif pre_quant_input is not None:
+        elif routed_pre_quant_input is not None:
             final_hidden_states = self.experts(
-                hidden_states, topk_output, pre_quant_input=pre_quant_input
+                hidden_states, topk_output, pre_quant_input=routed_pre_quant_input
             )
         else:
             final_hidden_states = self.experts(hidden_states, topk_output)
@@ -1015,7 +1035,7 @@ class DeepseekV2MoE(nn.Module):
             shared_output = self._forward_shared_experts(
                 hidden_states,
                 gemm_output_zero_allocator,
-                pre_quant_input=pre_quant_input,
+                pre_quant_input=shared_pre_quant_input,
             )
 
         current_stream.wait_stream(self.alt_stream)
@@ -1055,6 +1075,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
         num_token_non_padded: Optional[torch.Tensor] = None,
+        pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1073,11 +1094,11 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE): only worthwhile when
             # the shared expert also runs here on the same tensor.
-            pre_quant_input = (
-                None
-                if skip_shared_experts
-                else self._maybe_quant_moe_input_once(hidden_states)
-            )
+            routed_pre_quant_input = None
+            shared_pre_quant_input = None if skip_shared_experts else pre_quant_input
+            if shared_pre_quant_input is None and not skip_shared_experts:
+                routed_pre_quant_input = self._maybe_quant_moe_input_once(hidden_states)
+                shared_pre_quant_input = routed_pre_quant_input
             if (
                 not defer_shared
                 and not self._fuse_shared_experts_inside_sbo
@@ -1086,7 +1107,7 @@ class DeepseekV2MoE(nn.Module):
                 shared_output = self._forward_shared_experts(
                     hidden_states,
                     gemm_output_zero_allocator,
-                    pre_quant_input=pre_quant_input,
+                    pre_quant_input=shared_pre_quant_input,
                 )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
@@ -1103,7 +1124,8 @@ class DeepseekV2MoE(nn.Module):
                 **topk_kwargs,
             )
         else:
-            pre_quant_input = None
+            routed_pre_quant_input = None
+            shared_pre_quant_input = None
             shared_output = None
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id
@@ -1139,11 +1161,11 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        if pre_quant_input is not None:
+        if routed_pre_quant_input is not None:
             final_hidden_states = self.experts(
                 hidden_states,
                 topk_output,
-                pre_quant_input=pre_quant_input,
+                pre_quant_input=routed_pre_quant_input,
             )
         else:
             final_hidden_states = self.experts(
@@ -1169,7 +1191,7 @@ class DeepseekV2MoE(nn.Module):
             shared_output = self._forward_shared_experts(
                 hidden_states,
                 gemm_output_zero_allocator,
-                pre_quant_input=pre_quant_input,
+                pre_quant_input=shared_pre_quant_input,
             )
 
         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
@@ -2376,21 +2398,56 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
-        communicator_cls = (
-            DSACPLayerCommunicator
-            if get_parallel().enable_prefill_cp
-            else LayerCommunicator
+        attention_input_linear = getattr(
+            self.self_attn,
+            "fused_qkv_a_proj_with_mqa",
+            getattr(self.self_attn, "q_proj", None),
         )
-        self.layer_communicator = communicator_cls(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-            allow_reduce_scatter=True,
-            is_last_layer=(
-                is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
-            ),
-            qkv_latent_func=self.self_attn.prepare_qkv_latent,
+        enable_fused_ar_quant = _linear_accepts_flashinfer_fused_ar_quant(
+            attention_input_linear
         )
+        mlp_input_linear = getattr(self.mlp, "gate_up_proj", None)
+        if mlp_input_linear is None:
+            mlp_input_linear = getattr(
+                getattr(self.mlp, "shared_experts", None), "gate_up_proj", None
+            )
+        enable_fused_post_attention_ar_quant = (
+            _linear_accepts_flashinfer_fused_ar_quant(mlp_input_linear)
+        )
+        if isinstance(self.mlp, DeepseekV2MoE) and (
+            self.mlp._enable_a2a_moe or self.mlp._fuse_shared_experts_inside_sbo
+        ):
+            enable_fused_post_attention_ar_quant = False
+
+        if get_parallel().enable_prefill_cp:
+            # DSACPLayerCommunicator is flavor-agnostic; its internal gates
+            # read both dsa_use_prefill_cp and mla_use_prefill_cp. The rename
+            # to CPLayerCommunicator is deferred to a cleanup PR.
+            self.layer_communicator = DSACPLayerCommunicator(
+                layer_scatter_modes=self.layer_scatter_modes,
+                input_layernorm=self.input_layernorm,
+                post_attention_layernorm=self.post_attention_layernorm,
+                allow_reduce_scatter=True,
+                is_last_layer=(
+                    is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
+                ),
+                qkv_latent_func=self.self_attn.prepare_qkv_latent,
+            )
+        else:
+            self.layer_communicator = LayerCommunicator(
+                layer_scatter_modes=self.layer_scatter_modes,
+                input_layernorm=self.input_layernorm,
+                post_attention_layernorm=self.post_attention_layernorm,
+                allow_reduce_scatter=True,
+                is_last_layer=(
+                    is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
+                ),
+                qkv_latent_func=self.self_attn.prepare_qkv_latent,
+                enable_fused_ar_quant=enable_fused_ar_quant,
+                enable_fused_post_attention_ar_quant=(
+                    enable_fused_post_attention_ar_quant
+                ),
+            )
 
     def _detect_gfx95_quant_format(self) -> str:
         if not _is_gfx95_supported:
@@ -2478,6 +2535,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        mlp_pre_quant = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, fp8_hidden_states, fp8_scale = hidden_states
+            mlp_pre_quant = (fp8_hidden_states, fp8_scale)
 
         fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -2509,11 +2570,20 @@ class DeepseekV2DecoderLayer(nn.Module):
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
             with _mlp_ctx:
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    gemm_output_zero_allocator,
-                )
+                if isinstance(self.mlp, DeepseekV2MLP):
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        forward_batch,
+                        gemm_output_zero_allocator,
+                        gateup_pre_quant=mlp_pre_quant,
+                    )
+                else:
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        forward_batch,
+                        gemm_output_zero_allocator,
+                        pre_quant_input=mlp_pre_quant,
+                    )
 
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True

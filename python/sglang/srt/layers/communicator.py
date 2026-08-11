@@ -528,6 +528,7 @@ class LayerCommunicator:
         force_layernorm_before_dp_gather: bool = False,
         enable_fused_ar_quant: bool = False,
         fused_ar_quant_keep_bf16: bool = False,
+        enable_fused_post_attention_ar_quant: bool = False,
         _is_sp_variant: bool = False,
     ):
         self.layer_scatter_modes = layer_scatter_modes
@@ -543,6 +544,9 @@ class LayerCommunicator:
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
             force_layernorm_before_dp_gather
+        )
+        self._context.enable_fused_post_attention_ar_quant = (
+            enable_fused_post_attention_ar_quant
         )
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
@@ -570,6 +574,9 @@ class LayerCommunicator:
                 force_layernorm_before_dp_gather=force_layernorm_before_dp_gather,
                 enable_fused_ar_quant=enable_fused_ar_quant,
                 fused_ar_quant_keep_bf16=fused_ar_quant_keep_bf16,
+                enable_fused_post_attention_ar_quant=(
+                    enable_fused_post_attention_ar_quant
+                ),
                 _is_sp_variant=True,
             )
 
@@ -698,13 +705,9 @@ class LayerCommunicator:
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     quant_result = None
-                    if (
-                        self.enable_fused_ar_quant
-                        and _use_aiter
-                        and hasattr(
-                            self.input_layernorm,
-                            "forward_with_allreduce_fusion_quant_per_group",
-                        )
+                    if self.enable_fused_ar_quant and hasattr(
+                        self.input_layernorm,
+                        "forward_with_allreduce_fusion_quant_per_group",
                     ):
                         # Try fused AR+RMSNorm+per-group-quant. Internally
                         # falls back to AR+RMSNorm + separate quant when the
@@ -997,6 +1000,7 @@ class CommunicateContext:
     cache = None
     tp_rank: int
     force_layernorm_before_dp_gather: bool = False
+    enable_fused_post_attention_ar_quant: bool = False
 
     def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
@@ -1225,6 +1229,18 @@ class CommunicateWithAllReduceAndLayerNormFn:
         (``moe_dense_tp_size > 1``): both hidden states and residual stay in
         ``TP_ATTN_FULL`` across the boundary.
         """
+        if context.enable_fused_post_attention_ar_quant and hasattr(
+            layernorm, "forward_with_allreduce_fusion_quant_per_group"
+        ):
+            quant_result = layernorm.forward_with_allreduce_fusion_quant_per_group(
+                hidden_states,
+                residual,
+                use_attn_tp_group=True,
+                keep_bf16=True,
+            )
+            if quant_result is not None:
+                return quant_result
+
         hidden_states = get_parallel().attn_tp_group.all_reduce(hidden_states)
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
@@ -1290,9 +1306,24 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 apply_aiter_all_reduce_fusion(hidden_states)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
-                hidden_states, residual = layernorm.forward_with_allreduce_fusion(
-                    hidden_states, residual, use_attn_tp_group=True
-                )
+                quant_result = None
+                if context.enable_fused_post_attention_ar_quant and hasattr(
+                    layernorm, "forward_with_allreduce_fusion_quant_per_group"
+                ):
+                    quant_result = (
+                        layernorm.forward_with_allreduce_fusion_quant_per_group(
+                            hidden_states,
+                            residual,
+                            use_attn_tp_group=True,
+                            keep_bf16=True,
+                        )
+                    )
+                if quant_result is not None:
+                    hidden_states, residual = quant_result
+                else:
+                    hidden_states, residual = layernorm.forward_with_allreduce_fusion(
+                        hidden_states, residual, use_attn_tp_group=True
+                    )
                 handled = True
 
             if not handled:

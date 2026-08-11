@@ -266,7 +266,8 @@ def _forward_with_allreduce_fusion_quant_per_group(
 ):
     """Fused AR + RMSNorm + per-group FP8 quant with graceful staged fallback.
 
-    The single-kernel quantized backend dispatch is ROCm + aiter + gfx95-only.
+    The single-kernel quantized backend dispatch is available through either
+    FlashInfer's TRT-LLM allreduce on CUDA/Blackwell or aiter on ROCm/gfx95.
     Other HIP/aiter runs can still use the 2-kernel fallback below to preserve
     the existing tuple handoff behavior.
 
@@ -278,7 +279,7 @@ def _forward_with_allreduce_fusion_quant_per_group(
 
     Fallback chain (best → worst):
 
-    1. Fully-fused AR+RMSNorm+per-group-quant  (aiter single kernel).
+    1. Fully-fused AR+RMSNorm+per-group-quant  (FlashInfer or aiter).
     2. Fused AR+RMSNorm followed by a separate per-1x128 quant
        (two kernels, still saves the 3-kernel unfused baseline path).
     3. ``None`` so the caller can run the generic unfused path.
@@ -289,7 +290,48 @@ def _forward_with_allreduce_fusion_quant_per_group(
     lossy. Standard attention layers (single FP8 ``qkv_proj``) use
     ``keep_bf16=False``.
     """
-    if residual is None or not _use_aiter:
+    if residual is None:
+        return None
+
+    if _is_cuda:
+        if keep_bf16:
+            from sglang.srt.layers.flashinfer_comm_fusion import (
+                flashinfer_allreduce_residual_rmsnorm_quant_per_group_with_norm,
+            )
+
+            fp8_out, residual_out, scale_out, bf16_out = (
+                flashinfer_allreduce_residual_rmsnorm_quant_per_group_with_norm(
+                    input_tensor=x,
+                    residual=residual,
+                    weight=weight,
+                    eps=norm_module.variance_epsilon,
+                    group_size=group_size,
+                    max_token_num=max(x.shape[0], 2048),
+                    use_attn_tp_group=use_attn_tp_group,
+                )
+            )
+            if fp8_out is not None:
+                return (bf16_out, fp8_out, scale_out), residual_out
+        else:
+            from sglang.srt.layers.flashinfer_comm_fusion import (
+                flashinfer_allreduce_residual_rmsnorm_quant_per_group,
+            )
+
+            fp8_out, residual_out, scale_out = (
+                flashinfer_allreduce_residual_rmsnorm_quant_per_group(
+                    input_tensor=x,
+                    residual=residual,
+                    weight=weight,
+                    eps=norm_module.variance_epsilon,
+                    group_size=group_size,
+                    max_token_num=max(x.shape[0], 2048),
+                    use_attn_tp_group=use_attn_tp_group,
+                )
+            )
+            if fp8_out is not None:
+                return (fp8_out, scale_out), residual_out
+
+    if not _use_aiter:
         return None
 
     from sglang.srt.distributed import (
@@ -910,7 +952,7 @@ class RMSNorm(BaseFusedOp):
         use_attn_tp_group: bool = True,
         keep_bf16: bool = False,
     ):
-        """Fused AR + RMSNorm + per-group FP8 quant (ROCm/aiter path).
+        """Fused AR + RMSNorm + per-group FP8 quant.
 
         Returns ``((fp8, scale), residual)`` when ``keep_bf16=False``;
         ``((bf16, fp8, scale), residual)`` when ``keep_bf16=True``;

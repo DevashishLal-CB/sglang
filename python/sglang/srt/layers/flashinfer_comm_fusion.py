@@ -773,6 +773,246 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     return norm_out, residual_out
 
 
+def _allocate_packed_fp8_group_scale(
+    input_tensor: torch.Tensor, group_size: int
+) -> torch.Tensor:
+    """Allocate FlashInfer/DeepGEMM's MN-major packed UE8M0 scale layout."""
+    token_num, hidden_dim = input_tensor.shape
+    groups_per_row = hidden_dim // group_size
+    packed_groups_per_row = (groups_per_row + 3) // 4
+    aligned_token_num = ceil_align(token_num, 4)
+    return torch.empty_strided(
+        (token_num, packed_groups_per_row),
+        (1, aligned_token_num),
+        dtype=torch.int32,
+        device=input_tensor.device,
+    )
+
+
+def fake_flashinfer_allreduce_residual_rmsnorm_quant_per_group(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    group_size: int = 128,
+    max_token_num: int = 16384,
+    use_oneshot: Optional[bool] = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del eps, max_token_num, use_oneshot, trigger_completion_at_end, fp32_acc
+    del use_attn_tp_group, weight
+    quant_out = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+    residual_out = torch.empty_like(residual)
+    scale_out = _allocate_packed_fp8_group_scale(input_tensor, group_size)
+    return quant_out, residual_out, scale_out
+
+
+def fake_flashinfer_allreduce_residual_rmsnorm_quant_per_group_with_norm(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    group_size: int = 128,
+    max_token_num: int = 16384,
+    use_oneshot: Optional[bool] = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    quant_out, residual_out, scale_out = (
+        fake_flashinfer_allreduce_residual_rmsnorm_quant_per_group(
+            input_tensor,
+            residual,
+            weight,
+            eps,
+            group_size,
+            max_token_num,
+            use_oneshot,
+            trigger_completion_at_end,
+            fp32_acc,
+            use_attn_tp_group,
+        )
+    )
+    norm_out = torch.empty_like(input_tensor)
+    return quant_out, residual_out, scale_out, norm_out
+
+
+def _flashinfer_allreduce_residual_rmsnorm_quant_per_group_impl(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    group_size: int,
+    max_token_num: int,
+    use_oneshot: Optional[bool],
+    trigger_completion_at_end: bool,
+    fp32_acc: bool,
+    use_attn_tp_group: bool,
+    emit_norm: bool,
+):
+    pattern_name = (
+        "kARResidualRMSNormOutPerTokenGroupFP8PackedQuant"
+        if emit_norm
+        else "kARResidualRMSNormPerTokenGroupFP8PackedQuant"
+    )
+    unsupported = (None, None, None, None)
+
+    if not is_flashinfer_available() or _flashinfer_comm is None:
+        return unsupported
+
+    pattern = getattr(
+        _flashinfer_comm.AllReduceFusionPattern,
+        pattern_name,
+        None,
+    )
+    if pattern is None:
+        logger.debug("FlashInfer packed group-FP8 allreduce pattern is unavailable")
+        return unsupported
+
+    if resolve_flashinfer_allreduce_fusion_backend() != "trtllm":
+        logger.debug(
+            "FlashInfer packed group-FP8 allreduce requires the trtllm backend"
+        )
+        return unsupported
+
+    if use_attn_tp_group:
+        world_size = get_parallel().attn_tp_size
+    else:
+        world_size = (
+            get_parallel().moe_ep_size
+            if get_parallel().moe_ep_size > 1
+            else get_parallel().moe_tp_size
+        )
+    if world_size <= 1 or input_tensor.shape[0] == 0:
+        return unsupported
+    if input_tensor.dim() != 2 or input_tensor.shape[-1] % group_size != 0:
+        return unsupported
+    if input_tensor.shape[0] > max_token_num:
+        return unsupported
+    if (
+        not input_tensor.is_contiguous()
+        or not residual.is_contiguous()
+        or not weight.is_contiguous()
+    ):
+        return unsupported
+
+    if not ensure_workspace_initialized(
+        max_token_num=max_token_num,
+        hidden_dim=input_tensor.shape[-1],
+        use_fp32_lamport=(input_tensor.dtype == torch.float32),
+        dtype=input_tensor.dtype,
+        token_num=input_tensor.shape[0],
+        use_oneshot=use_oneshot,
+        use_attn_tp_group=use_attn_tp_group,
+    ):
+        return unsupported
+
+    workspace = _get_workspace_manager(use_attn_tp_group).workspace
+    if workspace is None or getattr(workspace, "backend", "trtllm") != "trtllm":
+        return unsupported
+
+    quant_out = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+    residual_out = torch.empty_like(residual)
+    scale_out = _allocate_packed_fp8_group_scale(input_tensor, group_size)
+    norm_out = torch.empty_like(input_tensor) if emit_norm else None
+    kwargs = dict(
+        input=input_tensor,
+        workspace=workspace,
+        pattern=pattern,
+        launch_with_pdl=True,
+        residual_out=residual_out,
+        norm_out=norm_out,
+        quant_out=quant_out,
+        scale_out=scale_out,
+        residual_in=residual,
+        rms_gamma=weight,
+        rms_eps=eps,
+        block_quant_group_size=group_size,
+        use_oneshot=use_oneshot,
+        fp32_acc=fp32_acc,
+    )
+    if _flashinfer_allreduce_supports_trigger_completion:
+        kwargs["trigger_completion_at_end"] = trigger_completion_at_end
+    _flashinfer_comm.allreduce_fusion(**kwargs)
+    return quant_out, residual_out, scale_out, norm_out
+
+
+@register_custom_op(
+    mutates_args=["input_tensor", "residual", "weight"],
+    fake_impl=fake_flashinfer_allreduce_residual_rmsnorm_quant_per_group,
+)
+def flashinfer_allreduce_residual_rmsnorm_quant_per_group(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    group_size: int = 128,
+    max_token_num: int = 2048,
+    use_oneshot: Optional[bool] = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse all-reduce, residual add, RMSNorm, and blockwise FP8 quant.
+
+    FlashInfer's packed per-token-group pattern emits the MN-major packed
+    UE8M0 scale layout consumed directly by Blackwell DeepGEMM. The pattern is
+    currently implemented only by FlashInfer's single-node TRT-LLM all-reduce
+    backend. Unsupported configurations return ``(None, None, None)`` so
+    callers can retain the plain all-reduce + RMSNorm path.
+    """
+    quant_out, residual_out, scale_out, _ = (
+        _flashinfer_allreduce_residual_rmsnorm_quant_per_group_impl(
+            input_tensor,
+            residual,
+            weight,
+            eps,
+            group_size,
+            max_token_num,
+            use_oneshot,
+            trigger_completion_at_end,
+            fp32_acc,
+            use_attn_tp_group,
+            emit_norm=False,
+        )
+    )
+    return quant_out, residual_out, scale_out
+
+
+@register_custom_op(
+    mutates_args=["input_tensor", "residual", "weight"],
+    fake_impl=fake_flashinfer_allreduce_residual_rmsnorm_quant_per_group_with_norm,
+)
+def flashinfer_allreduce_residual_rmsnorm_quant_per_group_with_norm(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    group_size: int = 128,
+    max_token_num: int = 2048,
+    use_oneshot: Optional[bool] = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+    use_attn_tp_group: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Packed group-FP8 fusion with an additional BF16 RMSNorm output."""
+    return _flashinfer_allreduce_residual_rmsnorm_quant_per_group_impl(
+        input_tensor,
+        residual,
+        weight,
+        eps,
+        group_size,
+        max_token_num,
+        use_oneshot,
+        trigger_completion_at_end,
+        fp32_acc,
+        use_attn_tp_group,
+        emit_norm=True,
+    )
+
+
 @register_custom_op(
     mutates_args=["input_tensor", "residual", "weight"],
     fake_impl=fake_flashinfer_allreduce_residual_rmsnorm,

@@ -28,6 +28,8 @@ class _FakeFlashInferComm:
     class AllReduceFusionPattern:
         kAllReduce = object()
         kARResidualRMSNorm = object()
+        kARResidualRMSNormPerTokenGroupFP8PackedQuant = object()
+        kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = object()
 
     def __init__(self):
         self.calls = []
@@ -51,6 +53,8 @@ class _FakeFlashInferComm:
         residual_in=None,
         rms_gamma=None,
         rms_eps=None,
+        quant_out=None,
+        scale_out=None,
         **_kwargs,
     ):
         self.fusion_kwargs = _kwargs
@@ -61,7 +65,11 @@ class _FakeFlashInferComm:
             output.copy_(allreduced)
             return output
 
-        if pattern is not self.AllReduceFusionPattern.kARResidualRMSNorm:
+        if pattern not in (
+            self.AllReduceFusionPattern.kARResidualRMSNorm,
+            self.AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant,
+            self.AllReduceFusionPattern.kARResidualRMSNormOutPerTokenGroupFP8PackedQuant,
+        ):
             raise ValueError(f"Unexpected pattern: {pattern}")
 
         allreduced = input * workspace.world_size
@@ -73,7 +81,11 @@ class _FakeFlashInferComm:
             * rms_gamma.to(torch.float32)
         ).to(input.dtype)
         residual_out.copy_(expected_residual)
-        norm_out.copy_(expected_norm)
+        if norm_out is not None:
+            norm_out.copy_(expected_norm)
+        if quant_out is not None:
+            quant_out.zero_()
+            scale_out.fill_(0x7F7F7F7F)
 
 
 def _torch_allreduce_residual_rmsnorm_baseline(
@@ -247,6 +259,88 @@ class TestFlashInferCommFusion(CustomTestCase):
                         fake_comm.fusion_kwargs.get("fp32_acc", False),
                         backend == "trtllm",
                     )
+        finally:
+            fusion._flashinfer_comm = original_comm
+            fusion._create_allreduce_fusion_workspace = original_create
+            if original_manager is None:
+                buffers.pop(manager_key, None)
+            else:
+                buffers[manager_key] = original_manager
+            fusion._flashinfer_allreduce_unavailable = original_unavailable
+
+    def test_packed_group_fp8_fusion_uses_deepgemm_scale_layout(self):
+        if not torch.cuda.is_available():
+            self.skipTest("FlashInfer allreduce custom op is CUDA-only")
+
+        fake_comm = _FakeFlashInferComm()
+        original_comm = fusion._flashinfer_comm
+        original_create = fusion._create_allreduce_fusion_workspace
+        original_unavailable = fusion._flashinfer_allreduce_unavailable
+        from sglang.srt.runtime_context import get_resources
+
+        buffers = get_resources().buffers
+        manager_key = "flashinfer_fusion_attn_tp_workspace"
+        original_manager = buffers.get(manager_key)
+        try:
+            fusion._flashinfer_comm = fake_comm
+            fusion._create_allreduce_fusion_workspace = (
+                fake_comm.create_allreduce_fusion_workspace
+            )
+            fusion._flashinfer_allreduce_unavailable = False
+            world_size = 4
+            manager = fusion.FlashInferWorkspaceManager()
+            manager.workspace = _FakeWorkspace("trtllm", world_size)
+            manager.initialized = True
+            buffers[manager_key] = manager
+
+            input_tensor = torch.randn(3, 512, dtype=torch.bfloat16, device="cuda")
+            residual = torch.randn_like(input_tensor)
+            weight = torch.randn(512, dtype=torch.bfloat16, device="cuda")
+            with (
+                patch.object(fusion, "is_flashinfer_available", return_value=True),
+                patch.object(
+                    fusion,
+                    "resolve_flashinfer_allreduce_fusion_backend",
+                    return_value="trtllm",
+                ),
+                patch.object(fusion, "ensure_workspace_initialized", return_value=True),
+                get_parallel().override(attn_tp_size=world_size),
+            ):
+                quant_out, residual_out, scale_out = (
+                    fusion.flashinfer_allreduce_residual_rmsnorm_quant_per_group(
+                        input_tensor=input_tensor,
+                        residual=residual,
+                        weight=weight,
+                        group_size=128,
+                        max_token_num=8,
+                    )
+                )
+                quant_with_norm, residual_with_norm, scale_with_norm, norm_out = (
+                    fusion.flashinfer_allreduce_residual_rmsnorm_quant_per_group_with_norm(
+                        input_tensor=input_tensor,
+                        residual=residual,
+                        weight=weight,
+                        group_size=128,
+                        max_token_num=8,
+                    )
+                )
+
+            self.assertEqual(quant_out.dtype, torch.float8_e4m3fn)
+            self.assertEqual(quant_out.shape, input_tensor.shape)
+            self.assertEqual(scale_out.dtype, torch.int32)
+            self.assertEqual(scale_out.shape, (3, 1))
+            self.assertEqual(scale_out.stride(), (1, 4))
+            torch.testing.assert_close(
+                residual_out, input_tensor * world_size + residual
+            )
+            self.assertTrue(torch.all(scale_out == 0x7F7F7F7F))
+            self.assertEqual(quant_with_norm.dtype, torch.float8_e4m3fn)
+            self.assertEqual(scale_with_norm.stride(), (1, 4))
+            torch.testing.assert_close(residual_with_norm, residual_out)
+            expected_norm, _ = _torch_allreduce_residual_rmsnorm_baseline(
+                input_tensor, residual, weight, world_size, 1e-6
+            )
+            torch.testing.assert_close(norm_out, expected_norm)
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._create_allreduce_fusion_workspace = original_create

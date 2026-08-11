@@ -17,6 +17,7 @@ from unittest import mock
 from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.models import deepseek_v2 as dsv2
 from sglang.srt.models.deepseek_common import attention_backend_handler as abh
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
@@ -140,6 +141,33 @@ class TestCPMLADispatch(CustomTestCase):
                                 abh._handle_attention_backend(attn, batch, "fa3"),
                                 expected,
                             )
+
+
+class TestFlashInferFusedARQuantDispatch(CustomTestCase):
+    def test_requires_trtllm_packed_deepgemm_block_quant(self):
+        quant_method = SimpleNamespace(
+            block_quant=True,
+            weight_block_size=[128, 128],
+            w8a8_block_fp8_linear=(dsv2.deepgemm_w8a8_block_fp8_linear_with_fallback),
+        )
+        linear = SimpleNamespace(quant_method=quant_method)
+        exec_config = SimpleNamespace(
+            comm=SimpleNamespace(flashinfer_allreduce_fusion_backend="trtllm")
+        )
+
+        with (
+            mock.patch.object(dsv2, "_is_cuda", True),
+            mock.patch.object(dsv2.deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", True),
+            mock.patch.object(dsv2, "get_exec", return_value=exec_config),
+        ):
+            self.assertTrue(dsv2._linear_accepts_flashinfer_fused_ar_quant(linear))
+
+            exec_config.comm.flashinfer_allreduce_fusion_backend = "mnnvl"
+            self.assertFalse(dsv2._linear_accepts_flashinfer_fused_ar_quant(linear))
+
+            exec_config.comm.flashinfer_allreduce_fusion_backend = "trtllm"
+            quant_method.weight_block_size = [128, 256]
+            self.assertFalse(dsv2._linear_accepts_flashinfer_fused_ar_quant(linear))
 
 
 if __name__ == "__main__":
